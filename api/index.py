@@ -1,86 +1,175 @@
 #!/usr/bin/env python3
-"""Spinners Cycling Club — Vercel Serverless API with Turso (persistent SQLite)"""
+"""Spinners Cycling Club — Vercel Serverless API with Turso (HTTP API)"""
 import json
 import os
+import sqlite3
+import urllib.request
+import urllib.error
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler
-
-import libsql_experimental as libsql
 
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 
-def get_db():
-    if TURSO_URL and TURSO_TOKEN:
-        conn = libsql.connect("spinners.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
-        conn.sync()
-    else:
-        # Fallback to local SQLite for dev
-        import sqlite3
-        conn = sqlite3.connect("/tmp/spinners.db", check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-    return conn
 
-def dict_row(cursor, row):
-    """Convert a row to dict when using libsql (which doesn't have row_factory)."""
-    cols = [d[0] for d in cursor.description]
-    return dict(zip(cols, row))
+# ── Turso HTTP API client (zero dependencies) ──
 
-def execute_query(conn, sql, params=None):
-    """Execute and return rows as list of dicts."""
-    cur = conn.execute(sql, params or [])
+def _turso_http_url():
+    """Convert libsql:// URL to https:// pipeline URL."""
+    url = TURSO_URL
+    url = url.replace("libsql://", "https://")
+    url = url.replace("ws://", "http://")
+    url = url.replace("wss://", "https://")
+    if not url.startswith("http"):
+        url = "https://" + url
+    return url.rstrip("/") + "/v2/pipeline"
+
+
+def _turso_request(requests_body):
+    """Send a pipeline request to Turso HTTP API and return parsed JSON."""
+    url = _turso_http_url()
+    data = json.dumps({"requests": requests_body}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {TURSO_TOKEN}")
+    req.add_header("Content-Type", "application/json")
+
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def turso_execute(sql, args=None):
+    """Execute a single SQL statement via Turso HTTP API. Returns rows as list of dicts."""
+    stmt = {"sql": sql}
+    if args:
+        stmt["args"] = [{"type": "text" if isinstance(a, str) else
+                          "integer" if isinstance(a, int) else
+                          "float" if isinstance(a, float) else
+                          "null", "value": str(a) if a is not None else None}
+                         for a in args]
+    body = [
+        {"type": "execute", "stmt": stmt},
+        {"type": "close"}
+    ]
+    resp = _turso_request(body)
+    results = resp.get("results", [])
+    if not results:
+        return []
+    result = results[0]
+    if result.get("type") == "error":
+        raise Exception(f"Turso error: {result.get('error', {}).get('message', 'unknown')}")
+    response = result.get("response", {})
+    res = response.get("result", {})
+    cols = [c["name"] for c in res.get("cols", [])]
+    rows_raw = res.get("rows", [])
+    rows = []
+    for row in rows_raw:
+        d = {}
+        for i, col in enumerate(cols):
+            cell = row[i]
+            val = cell.get("value")
+            if cell.get("type") == "integer" and val is not None:
+                val = int(val)
+            elif cell.get("type") == "float" and val is not None:
+                val = float(val)
+            d[col] = val
+        rows.append(d)
+    return rows
+
+
+def turso_execute_many(statements):
+    """Execute multiple statements in one pipeline request."""
+    body = []
+    for sql, args in statements:
+        stmt = {"sql": sql}
+        if args:
+            stmt["args"] = [{"type": "text" if isinstance(a, str) else
+                              "integer" if isinstance(a, int) else
+                              "float" if isinstance(a, float) else
+                              "null", "value": str(a) if a is not None else None}
+                             for a in args]
+        body.append({"type": "execute", "stmt": stmt})
+    body.append({"type": "close"})
+    return _turso_request(body)
+
+
+def turso_insert(sql, args=None):
+    """Execute an INSERT and return last_insert_rowid."""
+    stmt = {"sql": sql}
+    if args:
+        stmt["args"] = [{"type": "text" if isinstance(a, str) else
+                          "integer" if isinstance(a, int) else
+                          "float" if isinstance(a, float) else
+                          "null", "value": str(a) if a is not None else None}
+                         for a in args]
+    body = [
+        {"type": "execute", "stmt": stmt},
+        {"type": "close"}
+    ]
+    resp = _turso_request(body)
+    results = resp.get("results", [])
+    if results and results[0].get("type") != "error":
+        return results[0].get("response", {}).get("result", {}).get("last_insert_rowid", 0)
+    return 0
+
+
+# ── Local SQLite fallback (for dev without Turso) ──
+
+def local_execute(sql, args=None):
+    conn = sqlite3.connect("/tmp/spinners.db", check_same_thread=False)
+    cur = conn.execute(sql, args or [])
     if cur.description:
-        rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in rows]
-    return []
-
-def execute_insert(conn, sql, params=None):
-    """Execute an insert and return lastrowid."""
-    cur = conn.execute(sql, params or [])
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    else:
+        rows = []
     conn.commit()
-    return cur.lastrowid
+    conn.close()
+    return rows
 
-def execute_modify(conn, sql, params=None):
-    """Execute an update/delete."""
-    conn.execute(sql, params or [])
+
+def local_insert(sql, args=None):
+    conn = sqlite3.connect("/tmp/spinners.db", check_same_thread=False)
+    cur = conn.execute(sql, args or [])
     conn.commit()
+    rowid = cur.lastrowid
+    conn.close()
+    return rowid
+
+
+# ── Unified DB interface ──
+
+def use_turso():
+    return bool(TURSO_URL and TURSO_TOKEN)
+
+
+def db_execute(sql, args=None):
+    if use_turso():
+        return turso_execute(sql, args)
+    return local_execute(sql, args)
+
+
+def db_insert(sql, args=None):
+    if use_turso():
+        return turso_insert(sql, args)
+    return local_insert(sql, args)
+
+
+def db_modify(sql, args=None):
+    """Execute an UPDATE/DELETE."""
+    if use_turso():
+        turso_execute(sql, args)
+    else:
+        local_execute(sql, args)
+
+
+# ── Init DB ──
 
 def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS riders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            target_distance INTEGER DEFAULT 110,
-            fitness_level TEXT DEFAULT 'intermediate',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS rides (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rider_id INTEGER NOT NULL,
-            ride_date DATE NOT NULL,
-            distance_km REAL NOT NULL,
-            duration_mins INTEGER,
-            ride_type TEXT DEFAULT 'group',
-            notes TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (rider_id) REFERENCES riders(id)
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS training_completions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rider_id INTEGER NOT NULL,
-            week_number INTEGER NOT NULL,
-            day_key TEXT NOT NULL,
-            completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(rider_id, week_number, day_key)
-        )
-    """)
-    conn.commit()
+    stmts = [
+        ("CREATE TABLE IF NOT EXISTS riders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, target_distance INTEGER DEFAULT 110, fitness_level TEXT DEFAULT 'intermediate', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)", None),
+        ("CREATE TABLE IF NOT EXISTS rides (id INTEGER PRIMARY KEY AUTOINCREMENT, rider_id INTEGER NOT NULL, ride_date DATE NOT NULL, distance_km REAL NOT NULL, duration_mins INTEGER, ride_type TEXT DEFAULT 'group', notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (rider_id) REFERENCES riders(id))", None),
+        ("CREATE TABLE IF NOT EXISTS training_completions (id INTEGER PRIMARY KEY AUTOINCREMENT, rider_id INTEGER NOT NULL, week_number INTEGER NOT NULL, day_key TEXT NOT NULL, completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(rider_id, week_number, day_key))", None),
+    ]
 
     riders = [
         "Andrew Mackintosh", "Andrew Parkinson", "Dan", "Dan Crilly",
@@ -90,14 +179,20 @@ def init_db():
         "Mikey Hart Riding", "Not Paul", "Shannon Mccormick", "Jayden V"
     ]
     for name in riders:
-        try:
-            conn.execute("INSERT OR IGNORE INTO riders (name) VALUES (?)", [name])
-        except Exception:
-            pass
-    conn.commit()
-    if TURSO_URL and TURSO_TOKEN:
-        conn.sync()
-    conn.close()
+        stmts.append(("INSERT OR IGNORE INTO riders (name) VALUES (?)", [name]))
+
+    if use_turso():
+        turso_execute_many(stmts)
+    else:
+        conn = sqlite3.connect("/tmp/spinners.db", check_same_thread=False)
+        for sql, args in stmts:
+            try:
+                conn.execute(sql, args or [])
+            except Exception:
+                pass
+        conn.commit()
+        conn.close()
+
 
 _db_initialized = False
 
@@ -257,16 +352,14 @@ class handler(BaseHTTPRequestHandler):
                     k, v = p.split("=", 1)
                     params[k] = v
 
-        conn = get_db()
-
         try:
             if path == "/api/index":
-                rows = execute_query(conn, "SELECT * FROM riders ORDER BY name")
+                rows = db_execute("SELECT * FROM riders ORDER BY name")
                 json_response(self, rows)
 
             elif path.startswith("/api/index") and "/rider/" in path:
                 rider_id = int(path.split("/rider/")[1])
-                rows = execute_query(conn, "SELECT * FROM riders WHERE id = ?", [rider_id])
+                rows = db_execute("SELECT * FROM riders WHERE id = ?", [rider_id])
                 if not rows:
                     json_response(self, {"error": "Rider not found"}, 404)
                 else:
@@ -275,14 +368,14 @@ class handler(BaseHTTPRequestHandler):
             elif path == "/api/rides":
                 rider_id = params.get("rider_id")
                 if rider_id:
-                    rows = execute_query(conn, """
+                    rows = db_execute("""
                         SELECT r.*, ri.name as rider_name
                         FROM rides r JOIN riders ri ON r.rider_id = ri.id
                         WHERE r.rider_id = ?
                         ORDER BY r.ride_date DESC
                     """, [int(rider_id)])
                 else:
-                    rows = execute_query(conn, """
+                    rows = db_execute("""
                         SELECT r.*, ri.name as rider_name
                         FROM rides r JOIN riders ri ON r.rider_id = ri.id
                         ORDER BY r.ride_date DESC
@@ -291,7 +384,7 @@ class handler(BaseHTTPRequestHandler):
                 json_response(self, rows)
 
             elif path == "/api/stats":
-                rider_stats = execute_query(conn, """
+                rider_stats = db_execute("""
                     SELECT
                         ri.id, ri.name, ri.target_distance, ri.fitness_level,
                         COUNT(r.id) as total_rides,
@@ -305,7 +398,7 @@ class handler(BaseHTTPRequestHandler):
                     ORDER BY total_km DESC
                 """)
 
-                this_week = execute_query(conn, """
+                this_week = db_execute("""
                     SELECT DISTINCT ri.name, ri.id
                     FROM rides r JOIN riders ri ON r.rider_id = ri.id
                     WHERE r.ride_date >= date('now', 'weekday 0', '-7 days')
@@ -321,12 +414,12 @@ class handler(BaseHTTPRequestHandler):
 
             elif path.startswith("/api/training/"):
                 rider_id = int(path.split("/api/training/")[1])
-                riders = execute_query(conn, "SELECT * FROM riders WHERE id = ?", [rider_id])
+                riders = db_execute("SELECT * FROM riders WHERE id = ?", [rider_id])
                 if not riders:
                     json_response(self, {"error": "Rider not found"}, 404)
                 else:
                     rider = riders[0]
-                    completions = execute_query(conn,
+                    completions = db_execute(
                         "SELECT week_number, day_key FROM training_completions WHERE rider_id = ?",
                         [rider_id]
                     )
@@ -337,25 +430,22 @@ class handler(BaseHTTPRequestHandler):
 
             else:
                 json_response(self, {"error": "Not found"}, 404)
-        finally:
-            conn.close()
+        except Exception as e:
+            json_response(self, {"error": str(e)}, 500)
 
     def do_POST(self):
         ensure_db()
         path = self.path.split("?")[0]
         body = read_body(self)
-        conn = get_db()
 
         try:
             if path == "/api/rides":
-                lastid = execute_insert(conn,
+                lastid = db_insert(
                     "INSERT INTO rides (rider_id, ride_date, distance_km, duration_mins, ride_type, notes) VALUES (?, ?, ?, ?, ?, ?)",
                     [body["rider_id"], body["ride_date"], body["distance_km"],
                      body.get("duration_mins"), body.get("ride_type", "group"), body.get("notes", "")]
                 )
-                if TURSO_URL and TURSO_TOKEN:
-                    conn.sync()
-                rows = execute_query(conn, """
+                rows = db_execute("""
                     SELECT r.*, ri.name as rider_name
                     FROM rides r JOIN riders ri ON r.rider_id = ri.id
                     WHERE r.id = ?
@@ -363,38 +453,33 @@ class handler(BaseHTTPRequestHandler):
                 json_response(self, rows[0] if rows else {}, 201)
 
             elif path == "/api/training/complete":
-                execute_modify(conn,
+                db_modify(
                     "INSERT OR REPLACE INTO training_completions (rider_id, week_number, day_key) VALUES (?, ?, ?)",
                     [body["rider_id"], body["week_number"], body["day_key"]]
                 )
-                if TURSO_URL and TURSO_TOKEN:
-                    conn.sync()
                 json_response(self, {"status": "completed"}, 201)
 
             else:
                 json_response(self, {"error": "Not found"}, 404)
-        finally:
-            conn.close()
+        except Exception as e:
+            json_response(self, {"error": str(e)}, 500)
 
     def do_PUT(self):
         ensure_db()
         path = self.path.split("?")[0]
         body = read_body(self)
-        conn = get_db()
 
         try:
             if "/rider/" in path:
                 rider_id = int(path.split("/rider/")[1])
-                execute_modify(conn, "UPDATE riders SET target_distance = ?, fitness_level = ? WHERE id = ?",
-                           [body.get("target_distance", 110), body.get("fitness_level", "intermediate"), rider_id])
-                if TURSO_URL and TURSO_TOKEN:
-                    conn.sync()
-                rows = execute_query(conn, "SELECT * FROM riders WHERE id = ?", [rider_id])
+                db_modify("UPDATE riders SET target_distance = ?, fitness_level = ? WHERE id = ?",
+                          [body.get("target_distance", 110), body.get("fitness_level", "intermediate"), rider_id])
+                rows = db_execute("SELECT * FROM riders WHERE id = ?", [rider_id])
                 json_response(self, rows[0] if rows else {})
             else:
                 json_response(self, {"error": "Not found"}, 404)
-        finally:
-            conn.close()
+        except Exception as e:
+            json_response(self, {"error": str(e)}, 500)
 
     def do_DELETE(self):
         ensure_db()
@@ -406,29 +491,23 @@ class handler(BaseHTTPRequestHandler):
                     k, v = p.split("=", 1)
                     params[k] = v
 
-        conn = get_db()
-
         try:
             if path.startswith("/api/rides/"):
                 ride_id = int(path.split("/api/rides/")[1])
-                execute_modify(conn, "DELETE FROM rides WHERE id = ?", [ride_id])
-                if TURSO_URL and TURSO_TOKEN:
-                    conn.sync()
+                db_modify("DELETE FROM rides WHERE id = ?", [ride_id])
                 json_response(self, {"deleted": ride_id})
 
             elif path == "/api/training/complete":
                 rider_id = params.get("rider_id")
                 week_number = params.get("week_number")
                 day_key = params.get("day_key")
-                execute_modify(conn,
+                db_modify(
                     "DELETE FROM training_completions WHERE rider_id = ? AND week_number = ? AND day_key = ?",
                     [rider_id, week_number, day_key]
                 )
-                if TURSO_URL and TURSO_TOKEN:
-                    conn.sync()
                 json_response(self, {"status": "uncompleted"})
 
             else:
                 json_response(self, {"error": "Not found"}, 404)
-        finally:
-            conn.close()
+        except Exception as e:
+            json_response(self, {"error": str(e)}, 500)

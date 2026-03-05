@@ -1,1 +1,2 @@
-libsql_experimental
+# No external dependencies needed — uses Python stdlib only
+# Turso connection is via HTTP API (urllib)
