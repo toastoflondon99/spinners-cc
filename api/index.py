@@ -1,30 +1,63 @@
 #!/usr/bin/env python3
-"""Spinners Cycling Club — Vercel Serverless API"""
-import sqlite3
+"""Spinners Cycling Club — Vercel Serverless API with Turso (persistent SQLite)"""
 import json
 import os
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler
 
-DB_PATH = "/tmp/spinners.db"
+import libsql_experimental as libsql
+
+TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "")
+TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 
 def get_db():
-    db = sqlite3.connect(DB_PATH, check_same_thread=False)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
-    return db
+    if TURSO_URL and TURSO_TOKEN:
+        conn = libsql.connect("spinners.db", sync_url=TURSO_URL, auth_token=TURSO_TOKEN)
+        conn.sync()
+    else:
+        # Fallback to local SQLite for dev
+        import sqlite3
+        conn = sqlite3.connect("/tmp/spinners.db", check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+    return conn
+
+def dict_row(cursor, row):
+    """Convert a row to dict when using libsql (which doesn't have row_factory)."""
+    cols = [d[0] for d in cursor.description]
+    return dict(zip(cols, row))
+
+def execute_query(conn, sql, params=None):
+    """Execute and return rows as list of dicts."""
+    cur = conn.execute(sql, params or [])
+    if cur.description:
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
+    return []
+
+def execute_insert(conn, sql, params=None):
+    """Execute an insert and return lastrowid."""
+    cur = conn.execute(sql, params or [])
+    conn.commit()
+    return cur.lastrowid
+
+def execute_modify(conn, sql, params=None):
+    """Execute an update/delete."""
+    conn.execute(sql, params or [])
+    conn.commit()
 
 def init_db():
-    db = get_db()
-    db.executescript("""
+    conn = get_db()
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS riders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             target_distance INTEGER DEFAULT 110,
             fitness_level TEXT DEFAULT 'intermediate',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS rides (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             rider_id INTEGER NOT NULL,
@@ -35,18 +68,19 @@ def init_db():
             notes TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (rider_id) REFERENCES riders(id)
-        );
-
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS training_completions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             rider_id INTEGER NOT NULL,
             week_number INTEGER NOT NULL,
             day_key TEXT NOT NULL,
             completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (rider_id) REFERENCES riders(id),
             UNIQUE(rider_id, week_number, day_key)
-        );
+        )
     """)
+    conn.commit()
 
     riders = [
         "Andrew Mackintosh", "Andrew Parkinson", "Dan", "Dan Crilly",
@@ -57,13 +91,22 @@ def init_db():
     ]
     for name in riders:
         try:
-            db.execute("INSERT OR IGNORE INTO riders (name) VALUES (?)", [name])
+            conn.execute("INSERT OR IGNORE INTO riders (name) VALUES (?)", [name])
         except Exception:
             pass
-    db.commit()
-    db.close()
+    conn.commit()
+    if TURSO_URL and TURSO_TOKEN:
+        conn.sync()
+    conn.close()
 
-init_db()
+_db_initialized = False
+
+def ensure_db():
+    global _db_initialized
+    if not _db_initialized:
+        init_db()
+        _db_initialized = True
+
 
 # ── Training plan generator ──
 
@@ -75,15 +118,12 @@ def generate_training_plan(target_distance, fitness_level):
     is_110 = target_distance >= 100
 
     if fitness_level == "beginner":
-        base_weekly_hours = 4
         long_ride_start = 30 if is_110 else 25
         long_ride_peak = 85 if is_110 else 65
     elif fitness_level == "advanced":
-        base_weekly_hours = 8
         long_ride_start = 50 if is_110 else 40
         long_ride_peak = 100 if is_110 else 75
     else:
-        base_weekly_hours = 6
         long_ride_start = 40 if is_110 else 30
         long_ride_peak = 90 if is_110 else 70
 
@@ -107,54 +147,54 @@ def generate_training_plan(target_distance, fitness_level):
         }
 
         if is_taper:
-            week_plan["theme"] = "TAPER WEEK — Fresh legs for race day"
+            week_plan["theme"] = "TAPER WEEK \u2014 Fresh legs for race day"
             week_plan["days"] = {
                 "tue": {"title": "Easy Spin", "description": "30-40 min easy spin. Keep the legs moving, nothing hard.", "duration": "30-40 min", "type": "easy", "zone": "Zone 1-2"},
                 "thu": {"title": "Short Openers", "description": "30 min easy with 4x30 sec hard efforts. Rest 2 min between. Flush out the legs.", "duration": "30 min", "type": "intervals", "zone": "Zone 2 + Zone 5 spikes"},
                 "sat": {"title": "Shakeout Ride", "description": f"Easy {long_ride_km}km ride. Relaxed pace, maybe ride part of the course if you can. Check your bike, tyres, nutrition plan.", "duration": f"{long_ride_km}km", "type": "long", "zone": "Zone 1-2"},
-                "sun": {"title": "RACE DAY — Tour de Brisbane", "description": f"{'110km' if is_110 else '80km'} Tour de Brisbane! Pace yourself on the first half. Save energy for Mt Coot-tha. Eat every 30-40 min. Drink before you're thirsty. Smash it boys!", "duration": f"{'110' if is_110 else '80'}km", "type": "event", "zone": "Race pace"}
+                "sun": {"title": "RACE DAY \u2014 Tour de Brisbane", "description": f"{'110km' if is_110 else '80km'} Tour de Brisbane! Pace yourself on the first half. Save energy for Mt Coot-tha. Eat every 30-40 min. Drink before you're thirsty. Smash it boys!", "duration": f"{'110' if is_110 else '80'}km", "type": "event", "zone": "Race pace"}
             }
         elif is_recovery:
-            week_plan["theme"] = "RECOVERY WEEK — Absorb the gains"
+            week_plan["theme"] = "RECOVERY WEEK \u2014 Absorb the gains"
             week_plan["days"] = {
                 "tue": {"title": "Easy Recovery Ride", "description": "45 min easy spin. Conversational pace. Coffee stop mandatory.", "duration": "45 min", "type": "easy", "zone": "Zone 1-2"},
                 "thu": {"title": "Light Tempo", "description": "50 min with 2x8 min tempo (Zone 3). Easy between. Nothing heroic.", "duration": "50 min", "type": "tempo", "zone": "Zone 2-3"},
-                "sat": {"title": f"Steady Long Ride — {long_ride_km}km", "description": f"Reduced distance this week. {long_ride_km}km at comfortable pace. Good group ride day.", "duration": f"~{round(long_ride_km / 25)}h", "type": "long", "zone": "Zone 2"}
+                "sat": {"title": f"Steady Long Ride \u2014 {long_ride_km}km", "description": f"Reduced distance this week. {long_ride_km}km at comfortable pace. Good group ride day.", "duration": f"~{round(long_ride_km / 25)}h", "type": "long", "zone": "Zone 2"}
             }
         else:
             if week <= 2:
-                week_plan["theme"] = f"BUILD PHASE {week} — Base & endurance"
+                week_plan["theme"] = f"BUILD PHASE {week} \u2014 Base & endurance"
                 tue_session = {"title": "Spiked Efforts", "description": f"90 min ride with {week + 1}x10 min blocks of Zone 3 effort. Include a 20-sec spike to Zone 5 every 2 minutes within each block. Zone 2 between blocks. Great for building race fitness.", "duration": "90 min", "type": "intervals", "zone": "Zone 3 + Zone 5 spikes"}
                 thu_session = {"title": "Threshold Ramps", "description": f"90 min ride with {week + 1}x12 min threshold ramps. Start each in Zone 2, ramp up through Zone 3-4 to Zone 5 by the end. Strong but controlled. Zone 2 recovery between.", "duration": "90 min", "type": "threshold", "zone": "Zone 2-5 progressive"}
             elif week <= 5:
-                week_plan["theme"] = "PEAK PHASE — Race simulation"
-                tue_session = {"title": "Hill Repeats", "description": f"90 min with {min(week, 5)}x5 min hill efforts (Zone 4-5). Find a steep climb — think Mt Coot-tha prep. Seated for 3 min, standing for 2 min. Zone 2 recovery descents.", "duration": "90 min", "type": "hills", "zone": "Zone 4-5"}
+                week_plan["theme"] = "PEAK PHASE \u2014 Race simulation"
+                tue_session = {"title": "Hill Repeats", "description": f"90 min with {min(week, 5)}x5 min hill efforts (Zone 4-5). Find a steep climb \u2014 think Mt Coot-tha prep. Seated for 3 min, standing for 2 min. Zone 2 recovery descents.", "duration": "90 min", "type": "hills", "zone": "Zone 4-5"}
                 thu_session = {"title": "Race Pace Blocks", "description": "90 min with 2x20 min at target race pace (Zone 3-4). This is what it'll feel like on the day. Practice eating and drinking during efforts.", "duration": "90 min", "type": "tempo", "zone": "Zone 3-4"}
             else:
-                week_plan["theme"] = "SHARPEN — Fine-tuning"
+                week_plan["theme"] = "SHARPEN \u2014 Fine-tuning"
                 tue_session = {"title": "Short Sharp Efforts", "description": "75 min with 6x3 min at Zone 4-5 with 3 min recovery. Keep the top end sharp without digging deep.", "duration": "75 min", "type": "intervals", "zone": "Zone 4-5"}
                 thu_session = {"title": "Tempo + Openers", "description": "60 min with 15 min Zone 3 tempo, then 4x30 sec sprints. Keeping the engine running without fatigue.", "duration": "60 min", "type": "tempo", "zone": "Zone 3 + sprints"}
 
             week_plan["days"] = {
                 "tue": tue_session,
-                "wed": {"title": "Group Ride — Spinners!", "description": "Morning group ride with the boys. Solid pace, practice riding in a bunch. Communication, drafting, rotating through. This is what it's all about.", "duration": "60-90 min", "type": "group", "zone": "Zone 2-3"},
+                "wed": {"title": "Group Ride \u2014 Spinners!", "description": "Morning group ride with the boys. Solid pace, practice riding in a bunch. Communication, drafting, rotating through. This is what it's all about.", "duration": "60-90 min", "type": "group", "zone": "Zone 2-3"},
                 "thu": thu_session,
-                "sat": {"title": f"Long Ride — {long_ride_km}km", "description": f"Build that endurance. {long_ride_km}km at a steady Zone 2 pace. Practice your race day nutrition — aim to eat something every 30-40 min after the first hour. {'Include Mt Coot-tha if possible.' if week >= 4 and is_110 else 'Steady and consistent.'}", "duration": f"~{round(long_ride_km / 25, 1)}h", "type": "long", "zone": "Zone 2"}
+                "sat": {"title": f"Long Ride \u2014 {long_ride_km}km", "description": f"Build that endurance. {long_ride_km}km at a steady Zone 2 pace. Practice your race day nutrition \u2014 aim to eat something every 30-40 min after the first hour. {'Include Mt Coot-tha if possible.' if week >= 4 and is_110 else 'Steady and consistent.'}", "duration": f"~{round(long_ride_km / 25, 1)}h", "type": "long", "zone": "Zone 2"}
             }
 
         plan.append(week_plan)
 
     nutrition = {
         "race_day": [
-            "Big breakfast 3 hours before start — oats, banana, toast with peanut butter",
-            "Eat every 30-40 minutes on the bike — gels, bars, bananas",
-            "Drink 500-750ml per hour — more if it's hot",
-            "Start eating early — don't wait until you're hungry",
+            "Big breakfast 3 hours before start \u2014 oats, banana, toast with peanut butter",
+            "Eat every 30-40 minutes on the bike \u2014 gels, bars, bananas",
+            "Drink 500-750ml per hour \u2014 more if it's hot",
+            "Start eating early \u2014 don't wait until you're hungry",
             "Caffeine gel or flat Coke at km 60+ for the final push"
         ],
         "training": [
             "Protein shake or meal within 30 min of finishing a ride",
-            "Carb load 2 days before the event — pasta, rice, bread",
+            "Carb load 2 days before the event \u2014 pasta, rice, bread",
             "Stay hydrated all week, not just on ride days",
             "Good sleep is the best performance enhancer"
         ]
@@ -163,11 +203,11 @@ def generate_training_plan(target_distance, fitness_level):
     coottha = {
         "gradient": "2km at 9% average",
         "tips": [
-            "Pace yourself — it comes at km 67 on the 110km, you'll be fatigued",
+            "Pace yourself \u2014 it comes at km 67 on the 110km, you'll be fatigued",
             "Stay seated for the first half to save your legs",
-            "Find a rhythm — don't surge and blow up",
+            "Find a rhythm \u2014 don't surge and blow up",
             "Gear down early, don't wait until you're grinding",
-            "The descent is technical — don't cook it on the way down"
+            "The descent is technical \u2014 don't cook it on the way down"
         ]
     }
 
@@ -180,6 +220,7 @@ def generate_training_plan(target_distance, fitness_level):
         "weeks_to_event": weeks_to_event,
         "event_date": "2026-04-12"
     }
+
 
 # ── Request handler ──
 
@@ -207,6 +248,7 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        ensure_db()
         path = self.path.split("?")[0]
         params = {}
         if "?" in self.path:
@@ -215,43 +257,41 @@ class handler(BaseHTTPRequestHandler):
                     k, v = p.split("=", 1)
                     params[k] = v
 
-        db = get_db()
+        conn = get_db()
 
         try:
             if path == "/api/index":
-                # Riders list
-                rows = db.execute("SELECT * FROM riders ORDER BY name").fetchall()
-                json_response(self, [dict(r) for r in rows])
+                rows = execute_query(conn, "SELECT * FROM riders ORDER BY name")
+                json_response(self, rows)
 
             elif path.startswith("/api/index") and "/rider/" in path:
-                # Single rider: /api/index/rider/10
                 rider_id = int(path.split("/rider/")[1])
-                row = db.execute("SELECT * FROM riders WHERE id = ?", [rider_id]).fetchone()
-                if not row:
+                rows = execute_query(conn, "SELECT * FROM riders WHERE id = ?", [rider_id])
+                if not rows:
                     json_response(self, {"error": "Rider not found"}, 404)
                 else:
-                    json_response(self, dict(row))
+                    json_response(self, rows[0])
 
             elif path == "/api/rides":
                 rider_id = params.get("rider_id")
                 if rider_id:
-                    rows = db.execute("""
+                    rows = execute_query(conn, """
                         SELECT r.*, ri.name as rider_name
                         FROM rides r JOIN riders ri ON r.rider_id = ri.id
                         WHERE r.rider_id = ?
                         ORDER BY r.ride_date DESC
-                    """, [int(rider_id)]).fetchall()
+                    """, [int(rider_id)])
                 else:
-                    rows = db.execute("""
+                    rows = execute_query(conn, """
                         SELECT r.*, ri.name as rider_name
                         FROM rides r JOIN riders ri ON r.rider_id = ri.id
                         ORDER BY r.ride_date DESC
                         LIMIT 100
-                    """).fetchall()
-                json_response(self, [dict(r) for r in rows])
+                    """)
+                json_response(self, rows)
 
             elif path == "/api/stats":
-                rider_stats = db.execute("""
+                rider_stats = execute_query(conn, """
                     SELECT
                         ri.id, ri.name, ri.target_distance, ri.fitness_level,
                         COUNT(r.id) as total_rides,
@@ -263,94 +303,101 @@ class handler(BaseHTTPRequestHandler):
                     LEFT JOIN rides r ON ri.id = r.rider_id
                     GROUP BY ri.id
                     ORDER BY total_km DESC
-                """).fetchall()
+                """)
 
-                this_week = db.execute("""
+                this_week = execute_query(conn, """
                     SELECT DISTINCT ri.name, ri.id
                     FROM rides r JOIN riders ri ON r.rider_id = ri.id
                     WHERE r.ride_date >= date('now', 'weekday 0', '-7 days')
                     ORDER BY ri.name
-                """).fetchall()
+                """)
 
                 json_response(self, {
-                    "rider_stats": [dict(r) for r in rider_stats],
-                    "this_week_riders": [dict(r) for r in this_week],
+                    "rider_stats": rider_stats,
+                    "this_week_riders": this_week,
                     "event_date": "2026-04-12",
                     "total_riders": len(rider_stats)
                 })
 
             elif path.startswith("/api/training/"):
                 rider_id = int(path.split("/api/training/")[1])
-                rider = db.execute("SELECT * FROM riders WHERE id = ?", [rider_id]).fetchone()
-                if not rider:
+                riders = execute_query(conn, "SELECT * FROM riders WHERE id = ?", [rider_id])
+                if not riders:
                     json_response(self, {"error": "Rider not found"}, 404)
                 else:
-                    completions = db.execute(
+                    rider = riders[0]
+                    completions = execute_query(conn,
                         "SELECT week_number, day_key FROM training_completions WHERE rider_id = ?",
                         [rider_id]
-                    ).fetchall()
+                    )
                     plan = generate_training_plan(rider["target_distance"], rider["fitness_level"])
                     plan["completed"] = [{"week": c["week_number"], "day": c["day_key"]} for c in completions]
-                    plan["rider"] = dict(rider)
+                    plan["rider"] = rider
                     json_response(self, plan)
 
             else:
                 json_response(self, {"error": "Not found"}, 404)
         finally:
-            db.close()
+            conn.close()
 
     def do_POST(self):
+        ensure_db()
         path = self.path.split("?")[0]
         body = read_body(self)
-        db = get_db()
+        conn = get_db()
 
         try:
             if path == "/api/rides":
-                cur = db.execute(
+                lastid = execute_insert(conn,
                     "INSERT INTO rides (rider_id, ride_date, distance_km, duration_mins, ride_type, notes) VALUES (?, ?, ?, ?, ?, ?)",
                     [body["rider_id"], body["ride_date"], body["distance_km"],
                      body.get("duration_mins"), body.get("ride_type", "group"), body.get("notes", "")]
                 )
-                db.commit()
-                row = db.execute("""
+                if TURSO_URL and TURSO_TOKEN:
+                    conn.sync()
+                rows = execute_query(conn, """
                     SELECT r.*, ri.name as rider_name
                     FROM rides r JOIN riders ri ON r.rider_id = ri.id
                     WHERE r.id = ?
-                """, [cur.lastrowid]).fetchone()
-                json_response(self, dict(row), 201)
+                """, [lastid])
+                json_response(self, rows[0] if rows else {}, 201)
 
             elif path == "/api/training/complete":
-                db.execute(
+                execute_modify(conn,
                     "INSERT OR REPLACE INTO training_completions (rider_id, week_number, day_key) VALUES (?, ?, ?)",
                     [body["rider_id"], body["week_number"], body["day_key"]]
                 )
-                db.commit()
+                if TURSO_URL and TURSO_TOKEN:
+                    conn.sync()
                 json_response(self, {"status": "completed"}, 201)
 
             else:
                 json_response(self, {"error": "Not found"}, 404)
         finally:
-            db.close()
+            conn.close()
 
     def do_PUT(self):
+        ensure_db()
         path = self.path.split("?")[0]
         body = read_body(self)
-        db = get_db()
+        conn = get_db()
 
         try:
             if "/rider/" in path:
                 rider_id = int(path.split("/rider/")[1])
-                db.execute("UPDATE riders SET target_distance = ?, fitness_level = ? WHERE id = ?",
+                execute_modify(conn, "UPDATE riders SET target_distance = ?, fitness_level = ? WHERE id = ?",
                            [body.get("target_distance", 110), body.get("fitness_level", "intermediate"), rider_id])
-                db.commit()
-                row = db.execute("SELECT * FROM riders WHERE id = ?", [rider_id]).fetchone()
-                json_response(self, dict(row))
+                if TURSO_URL and TURSO_TOKEN:
+                    conn.sync()
+                rows = execute_query(conn, "SELECT * FROM riders WHERE id = ?", [rider_id])
+                json_response(self, rows[0] if rows else {})
             else:
                 json_response(self, {"error": "Not found"}, 404)
         finally:
-            db.close()
+            conn.close()
 
     def do_DELETE(self):
+        ensure_db()
         path = self.path.split("?")[0]
         params = {}
         if "?" in self.path:
@@ -359,27 +406,29 @@ class handler(BaseHTTPRequestHandler):
                     k, v = p.split("=", 1)
                     params[k] = v
 
-        db = get_db()
+        conn = get_db()
 
         try:
             if path.startswith("/api/rides/"):
                 ride_id = int(path.split("/api/rides/")[1])
-                db.execute("DELETE FROM rides WHERE id = ?", [ride_id])
-                db.commit()
+                execute_modify(conn, "DELETE FROM rides WHERE id = ?", [ride_id])
+                if TURSO_URL and TURSO_TOKEN:
+                    conn.sync()
                 json_response(self, {"deleted": ride_id})
 
             elif path == "/api/training/complete":
                 rider_id = params.get("rider_id")
                 week_number = params.get("week_number")
                 day_key = params.get("day_key")
-                db.execute(
+                execute_modify(conn,
                     "DELETE FROM training_completions WHERE rider_id = ? AND week_number = ? AND day_key = ?",
                     [rider_id, week_number, day_key]
                 )
-                db.commit()
+                if TURSO_URL and TURSO_TOKEN:
+                    conn.sync()
                 json_response(self, {"status": "uncompleted"})
 
             else:
                 json_response(self, {"error": "Not found"}, 404)
         finally:
-            db.close()
+            conn.close()
