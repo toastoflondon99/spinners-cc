@@ -172,11 +172,11 @@ def init_db():
     ]
 
     riders = [
-        "Andrew M", "Andrew P", "Dan", "Dan C",
-        "Daniel C", "Daryll J", "Dirk V", "Matt T",
-        "Michael", "Michael O", "Robert G", "Shapz", "Tim D",
-        "Paul M", "Ben H", "James L", "Lachlan T",
-        "Mikey H", "Not Paul", "Shannon M", "Jayden V"
+        "Andrew M", "Andrew P", "Ben H", "Dan C",
+        "Dan S", "Daniel C", "Daryll J", "Dirk V",
+        "Jayden V", "Lachie T", "Matt T", "Michael O",
+        "Michael S", "Mike H", "Paul C", "Paul M",
+        "Rob G", "Shannon MM", "Shapz", "Tim D"
     ]
     for name in riders:
         stmts.append(("INSERT OR IGNORE INTO riders (name) VALUES (?)", [name]))
