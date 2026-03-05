@@ -1,0 +1,11 @@
+{
+  "rewrites": [
+    { "source": "/api/index", "destination": "/api/index" },
+    { "source": "/api/index/rider/:id", "destination": "/api/index" },
+    { "source": "/api/rides", "destination": "/api/index" },
+    { "source": "/api/rides/:id", "destination": "/api/index" },
+    { "source": "/api/stats", "destination": "/api/index" },
+    { "source": "/api/training/:id", "destination": "/api/index" },
+    { "source": "/api/training/complete", "destination": "/api/index" }
+  ]
+}
