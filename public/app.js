@@ -481,6 +481,8 @@ async function loadGroup() {
 }
 
 // ── Ride Modal ──
+let selectedBuddies = new Set();
+
 function openRideModal() {
   const today = new Date().toISOString().split("T")[0];
   document.getElementById("ride-date").value = today;
@@ -488,7 +490,35 @@ function openRideModal() {
   document.getElementById("ride-duration").value = "";
   document.getElementById("ride-type").value = "group";
   document.getElementById("ride-notes").value = "";
+  selectedBuddies.clear();
+  renderBuddyPicker();
   document.getElementById("ride-modal").classList.add("active");
+}
+
+function renderBuddyPicker() {
+  const container = document.getElementById("ride-buddies");
+  if (!container || !currentRider) return;
+  const others = allRiders.filter(r => r.id !== currentRider.id).sort((a, b) => a.name.localeCompare(b.name));
+  container.innerHTML = others.map(r => {
+    const sel = selectedBuddies.has(r.id) ? "selected" : "";
+    const firstName = r.name.split(" ")[0];
+    const checkSvg = selectedBuddies.has(r.id)
+      ? '<svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="4"><polyline points="20 6 9 17 4 12"/></svg>'
+      : '';
+    return `<button type="button" class="rider-chip ${sel}" onclick="toggleBuddy(${r.id})">
+      <span class="chip-check">${checkSvg}</span>
+      ${escHtml(firstName === r.name ? r.name : firstName + " " + r.name.split(" ").slice(1).map(w => w[0]).join(""))}
+    </button>`;
+  }).join("");
+}
+
+function toggleBuddy(id) {
+  if (selectedBuddies.has(id)) {
+    selectedBuddies.delete(id);
+  } else {
+    selectedBuddies.add(id);
+  }
+  renderBuddyPicker();
 }
 
 function closeRideModal() {
@@ -502,7 +532,8 @@ async function submitRide() {
     distance_km: parseFloat(document.getElementById("ride-distance").value) || 0,
     duration_mins: parseInt(document.getElementById("ride-duration").value) || null,
     ride_type: document.getElementById("ride-type").value,
-    notes: document.getElementById("ride-notes").value
+    notes: document.getElementById("ride-notes").value,
+    additional_rider_ids: Array.from(selectedBuddies)
   };
 
   if (!data.ride_date || data.distance_km <= 0) {

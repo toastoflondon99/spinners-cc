@@ -440,17 +440,28 @@ class handler(BaseHTTPRequestHandler):
 
         try:
             if path == "/api/rides":
-                lastid = db_insert(
-                    "INSERT INTO rides (rider_id, ride_date, distance_km, duration_mins, ride_type, notes) VALUES (?, ?, ?, ?, ?, ?)",
-                    [body["rider_id"], body["ride_date"], body["distance_km"],
-                     body.get("duration_mins"), body.get("ride_type", "group"), body.get("notes", "")]
-                )
-                rows = db_execute("""
-                    SELECT r.*, ri.name as rider_name
-                    FROM rides r JOIN riders ri ON r.rider_id = ri.id
-                    WHERE r.id = ?
-                """, [lastid])
-                json_response(self, rows[0] if rows else {}, 201)
+                # Collect all rider IDs — the logger plus anyone they tagged
+                all_rider_ids = [body["rider_id"]]
+                extra_ids = body.get("additional_rider_ids", [])
+                for rid in extra_ids:
+                    if rid and rid != body["rider_id"] and rid not in all_rider_ids:
+                        all_rider_ids.append(rid)
+
+                created = []
+                for rid in all_rider_ids:
+                    lastid = db_insert(
+                        "INSERT INTO rides (rider_id, ride_date, distance_km, duration_mins, ride_type, notes) VALUES (?, ?, ?, ?, ?, ?)",
+                        [rid, body["ride_date"], body["distance_km"],
+                         body.get("duration_mins"), body.get("ride_type", "group"), body.get("notes", "")]
+                    )
+                    rows = db_execute("""
+                        SELECT r.*, ri.name as rider_name
+                        FROM rides r JOIN riders ri ON r.rider_id = ri.id
+                        WHERE r.id = ?
+                    """, [lastid])
+                    if rows:
+                        created.append(rows[0])
+                json_response(self, created if len(created) != 1 else created[0], 201)
 
             elif path == "/api/training/complete":
                 db_modify(

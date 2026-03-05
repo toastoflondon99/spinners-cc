@@ -990,3 +990,59 @@ body {
 .footer a:hover {
   color: var(--color-text-muted);
 }
+
+/* ── Rider picker (group ride buddy select) ── */
+
+.rider-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 160px;
+  overflow-y: auto;
+  padding: var(--space-1) 0;
+}
+
+.rider-chip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid var(--color-divider);
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.rider-chip:hover {
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.rider-chip.selected {
+  background: var(--color-primary-muted);
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.rider-chip .chip-check {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all var(--transition-fast);
+}
+
+.rider-chip.selected .chip-check {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+}
