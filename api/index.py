@@ -175,7 +175,7 @@ def init_db():
         "Andrew M", "Andrew P", "Ben H", "Dan C",
         "Dan S", "Daniel C", "Daryll J", "Dirk V",
         "Jayden V", "Lachie T", "Matt T", "Michael O",
-        "Michael S", "Mike H", "Paul C", "Paul M",
+        "Michael S", "Mike H", "Paul C", "Paul M (C)",
         "Rob G", "Shannon MM", "Shapz", "Tim D"
     ]
     for name in riders:
