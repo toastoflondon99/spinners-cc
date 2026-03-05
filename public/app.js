@@ -194,7 +194,7 @@ async function loadDashboard() {
               <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"/><path d="M8 12h8M12 8v8"/></svg>
               <p>No rides logged yet. Hit "Log Ride" to get started.</p>
             </div>`
-          : `<div>${myRides.slice(0, 5).map(r => renderRideItem(r)).join("")}</div>`
+          : `<div>${myRides.slice(0, 5).map(r => renderRideItem(r, true)).join("")}</div>`
         }
       </div>
 
@@ -554,9 +554,10 @@ async function submitRide() {
 }
 
 async function deleteRide(id) {
+  if (!confirm("Delete this ride?")) return;
   try {
     await fetch(`${API}/api/rides/${id}`, { method: "DELETE" });
-    loadRides();
+    switchTab(currentTab);
   } catch (e) {
     console.error("Delete ride error", e);
   }
