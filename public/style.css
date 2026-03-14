@@ -195,6 +195,25 @@ body {
   font-weight: 600;
 }
 
+.icon-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  transition: color var(--transition-fast), background var(--transition-fast);
+  cursor: pointer;
+  background: none;
+  border: none;
+}
+
+.icon-btn:hover {
+  color: var(--color-primary);
+  background: var(--color-surface);
+}
+
 .theme-toggle {
   width: 36px;
   height: 36px;
