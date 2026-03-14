@@ -11,6 +11,7 @@ let allRides = [];
 let currentTab = "dashboard";
 let pendingDistance = 110;
 let pendingFitness = "intermediate";
+let stravaConnected = false;
 
 // ── Init ──
 async function init() {
@@ -23,6 +24,41 @@ async function init() {
     allRiders = [];
   }
   renderLogin();
+
+  // Check for Strava OAuth callback result
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get("strava") === "connected") {
+    showToast("Strava connected!");
+    // Clean URL without reload
+    const cleanUrl = window.location.pathname;
+    window.history.replaceState({}, document.title, cleanUrl);
+  } else if (urlParams.get("strava") === "error") {
+    showToast("Strava connection failed. Please try again.", true);
+    const cleanUrl = window.location.pathname;
+    window.history.replaceState({}, document.title, cleanUrl);
+  }
+}
+
+// ── Toast notification ──
+function showToast(message, isError = false) {
+  const existing = document.getElementById("toast");
+  if (existing) existing.remove();
+
+  const toast = document.createElement("div");
+  toast.id = "toast";
+  toast.className = "toast" + (isError ? " toast-error" : "");
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  // Trigger animation
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => toast.classList.add("toast-visible"));
+  });
+
+  setTimeout(() => {
+    toast.classList.remove("toast-visible");
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
 }
 
 // ── Theme ──
@@ -67,6 +103,15 @@ async function selectRider(id) {
     return;
   }
 
+  // Load Strava status in parallel
+  try {
+    const statusRes = await fetch(`${API}/api/strava/status?rider_id=${id}`);
+    const statusData = await statusRes.json();
+    stravaConnected = statusData.connected === true;
+  } catch (e) {
+    stravaConnected = false;
+  }
+
   document.getElementById("login-screen").style.display = "none";
   document.getElementById("app").style.display = "block";
   document.getElementById("bottom-nav").style.display = "flex";
@@ -87,6 +132,7 @@ async function selectRider(id) {
 
 function logout() {
   currentRider = null;
+  stravaConnected = false;
   document.getElementById("login-screen").style.display = "flex";
   document.getElementById("app").style.display = "none";
   document.getElementById("bottom-nav").style.display = "none";
@@ -402,7 +448,8 @@ async function loadRides() {
 }
 
 function renderRideItem(ride, showDelete = false) {
-  const typeIcon = ride.ride_type === "group" ? "🚴‍♂️" : ride.ride_type === "race" ? "🏆" : "🚲";
+  const isStrava = ride.ride_type === "strava" || ride.strava_activity_id;
+  const typeIcon = ride.ride_type === "group" ? "🚴‍♂️" : ride.ride_type === "race" ? "🏆" : ride.ride_type === "strava" ? "🚲" : "🚲";
   const typeClass = ride.ride_type || "solo";
   const dateStr = formatDate(ride.ride_date);
   const speed = ride.duration_mins && ride.duration_mins > 0 ? (ride.distance_km / (ride.duration_mins / 60)).toFixed(1) : null;
@@ -411,7 +458,10 @@ function renderRideItem(ride, showDelete = false) {
     <div class="ride-item">
       <div class="ride-icon ${typeClass}">${typeIcon}</div>
       <div class="ride-details">
-        <div class="ride-title">${escHtml(ride.rider_name || "")} — ${ride.distance_km}km</div>
+        <div class="ride-title">
+          ${escHtml(ride.rider_name || "")} — ${ride.distance_km}km
+          ${isStrava ? '<span class="strava-badge">S</span>' : ""}
+        </div>
         <div class="ride-subtitle">
           <span class="ride-stat">${dateStr}</span>
           ${ride.duration_mins ? `<span class="ride-stat">${formatDuration(ride.duration_mins)}</span>` : ""}
@@ -568,6 +618,7 @@ function openSettings() {
   pendingDistance = currentRider.target_distance;
   pendingFitness = currentRider.fitness_level;
   updatePillToggles();
+  renderStravaSection();
   document.getElementById("settings-modal").classList.add("active");
 }
 
@@ -608,6 +659,73 @@ async function saveSettings() {
   } catch (e) {
     console.error("Save settings error", e);
   }
+}
+
+// ── Strava Integration ──
+function renderStravaSection() {
+  const section = document.getElementById("strava-section");
+  if (!section) return;
+
+  if (stravaConnected) {
+    section.innerHTML = `
+      <div class="strava-connected">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        Strava Connected
+      </div>
+      <div style="display:flex;gap:var(--space-2);margin-top:var(--space-3)">
+        <button id="strava-sync-btn" class="btn btn-sm btn-primary" onclick="syncStrava()" style="flex:1">Sync Now</button>
+        <button class="btn btn-sm btn-ghost" onclick="disconnectStrava()" style="color:var(--color-red)">Disconnect</button>
+      </div>
+    `;
+  } else {
+    section.innerHTML = `
+      <p style="font-size:var(--text-xs);color:var(--color-text-muted);margin-bottom:var(--space-3)">
+        Connect Strava to automatically import your rides.
+      </p>
+      <button class="btn strava-btn" onclick="connectStrava()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="flex-shrink:0"><path d="M15.387 17.944l-2.089-4.116h-3.065L15.387 24l5.15-10.172h-3.066m-7.008-5.599l2.836 5.598h4.172L10.463 0 4 13.828h4.172"/></svg>
+        Connect Strava
+      </button>
+    `;
+  }
+}
+
+async function connectStrava() {
+  if (!currentRider) return;
+  const res = await fetch(`${API}/api/strava/auth?rider_id=${currentRider.id}`);
+  const data = await res.json();
+  window.location.href = data.auth_url;
+}
+
+async function syncStrava() {
+  const btn = document.getElementById("strava-sync-btn");
+  if (btn) { btn.textContent = "Syncing..."; btn.disabled = true; }
+  try {
+    const res = await fetch(`${API}/api/strava/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rider_id: currentRider.id })
+    });
+    const data = await res.json();
+    if (btn) btn.textContent = `Synced ${data.synced} rides!`;
+    setTimeout(() => {
+      closeSettings();
+      switchTab(currentTab);
+    }, 1500);
+  } catch (e) {
+    if (btn) { btn.textContent = "Sync Failed"; btn.disabled = false; }
+  }
+}
+
+async function disconnectStrava() {
+  if (!confirm("Disconnect Strava?")) return;
+  await fetch(`${API}/api/strava/disconnect`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rider_id: currentRider.id })
+  });
+  stravaConnected = false;
+  openSettings(); // refresh the modal
 }
 
 // ── Helpers ──

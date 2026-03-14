@@ -3,13 +3,20 @@
 import json
 import os
 import sqlite3
+import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler
 
 TURSO_URL = os.environ.get("TURSO_DATABASE_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
+
+STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID", "211542")
+STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET", "")
+STRAVA_REDIRECT_URI = "https://spinners-cc-pxoq.vercel.app/api/strava/callback"
+STRAVA_APP_URL = "https://spinners-cc-pxoq.vercel.app"
 
 
 # ── Turso HTTP API client (zero dependencies) ──
@@ -167,8 +174,9 @@ def db_modify(sql, args=None):
 def init_db():
     stmts = [
         ("CREATE TABLE IF NOT EXISTS riders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, target_distance INTEGER DEFAULT 110, fitness_level TEXT DEFAULT 'intermediate', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)", None),
-        ("CREATE TABLE IF NOT EXISTS rides (id INTEGER PRIMARY KEY AUTOINCREMENT, rider_id INTEGER NOT NULL, ride_date DATE NOT NULL, distance_km REAL NOT NULL, duration_mins INTEGER, ride_type TEXT DEFAULT 'group', notes TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (rider_id) REFERENCES riders(id))", None),
+        ("CREATE TABLE IF NOT EXISTS rides (id INTEGER PRIMARY KEY AUTOINCREMENT, rider_id INTEGER NOT NULL, ride_date DATE NOT NULL, distance_km REAL NOT NULL, duration_mins INTEGER, ride_type TEXT DEFAULT 'group', notes TEXT, strava_activity_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (rider_id) REFERENCES riders(id))", None),
         ("CREATE TABLE IF NOT EXISTS training_completions (id INTEGER PRIMARY KEY AUTOINCREMENT, rider_id INTEGER NOT NULL, week_number INTEGER NOT NULL, day_key TEXT NOT NULL, completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(rider_id, week_number, day_key))", None),
+        ("CREATE TABLE IF NOT EXISTS strava_tokens (rider_id INTEGER PRIMARY KEY, strava_athlete_id INTEGER UNIQUE, access_token TEXT NOT NULL, refresh_token TEXT NOT NULL, expires_at INTEGER NOT NULL, connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (rider_id) REFERENCES riders(id))", None),
     ]
 
     riders = [
@@ -317,7 +325,135 @@ def generate_training_plan(target_distance, fitness_level):
     }
 
 
-# ── Request handler ──
+# ── Strava helpers ──
+
+def strava_exchange_code(code):
+    """Exchange an OAuth code for tokens."""
+    data = urllib.parse.urlencode({
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code"
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.strava.com/oauth/token",
+        data=data,
+        method="POST"
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def strava_refresh_token(refresh_token):
+    """Refresh an expired access token."""
+    data = urllib.parse.urlencode({
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token"
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://www.strava.com/oauth/token",
+        data=data,
+        method="POST"
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def strava_get_activities(access_token, per_page=30):
+    """Fetch recent activities from Strava."""
+    url = f"https://www.strava.com/api/v3/athlete/activities?per_page={per_page}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def strava_deauthorize(access_token):
+    """Deauthorize the app from Strava."""
+    try:
+        data = urllib.parse.urlencode({"access_token": access_token}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://www.strava.com/oauth/deauthorize",
+            data=data,
+            method="POST"
+        )
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass  # Best-effort
+
+
+def get_or_refresh_token(rider_id):
+    """Get a valid access token for the rider, refreshing if needed. Returns token_row or None."""
+    rows = db_execute("SELECT * FROM strava_tokens WHERE rider_id = ?", [rider_id])
+    if not rows:
+        return None
+    token_row = rows[0]
+    now = int(time.time())
+    if token_row["expires_at"] < now + 60:
+        # Refresh
+        new_tokens = strava_refresh_token(token_row["refresh_token"])
+        db_modify(
+            "UPDATE strava_tokens SET access_token = ?, refresh_token = ?, expires_at = ? WHERE rider_id = ?",
+            [new_tokens["access_token"], new_tokens["refresh_token"], int(new_tokens["expires_at"]), rider_id]
+        )
+        token_row["access_token"] = new_tokens["access_token"]
+        token_row["refresh_token"] = new_tokens["refresh_token"]
+        token_row["expires_at"] = int(new_tokens["expires_at"])
+    return token_row
+
+
+def sync_strava_rides(rider_id):
+    """Sync Strava rides for a rider. Returns (synced_count, total_count)."""
+    token_row = get_or_refresh_token(rider_id)
+    if not token_row:
+        raise Exception("No Strava token for this rider")
+
+    activities = strava_get_activities(token_row["access_token"], per_page=30)
+    total = len(activities)
+    synced = 0
+
+    for activity in activities:
+        # Only cycling activities
+        activity_type = activity.get("type", "") or activity.get("sport_type", "")
+        if "ride" not in activity_type.lower():
+            continue
+
+        strava_id = activity.get("id")
+        if not strava_id:
+            continue
+
+        # Check if already synced
+        existing = db_execute(
+            "SELECT id FROM rides WHERE rider_id = ? AND strava_activity_id = ?",
+            [rider_id, strava_id]
+        )
+        if existing:
+            continue
+
+        # Parse fields
+        distance_km = round((activity.get("distance") or 0) / 1000, 2)
+        duration_mins = round((activity.get("moving_time") or 0) / 60)
+        ride_date = (activity.get("start_date_local") or "")[:10]
+        notes = activity.get("name") or ""
+
+        if not ride_date or distance_km <= 0:
+            continue
+
+        db_insert(
+            "INSERT INTO rides (rider_id, ride_date, distance_km, duration_mins, ride_type, notes, strava_activity_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [rider_id, ride_date, distance_km, duration_mins, "strava", notes, strava_id]
+        )
+        synced += 1
+
+    return synced, total
+
+
+# ── Request handler helpers ──
 
 def json_response(self, data, status=200):
     self.send_response(status)
@@ -327,6 +463,12 @@ def json_response(self, data, status=200):
     self.send_header("Access-Control-Allow-Headers", "Content-Type")
     self.end_headers()
     self.wfile.write(json.dumps(data).encode())
+
+def redirect_response(self, url):
+    self.send_response(302)
+    self.send_header("Location", url)
+    self.send_header("Access-Control-Allow-Origin", "*")
+    self.end_headers()
 
 def read_body(self):
     length = int(self.headers.get("Content-Length", 0))
@@ -350,7 +492,7 @@ class handler(BaseHTTPRequestHandler):
             for p in self.path.split("?")[1].split("&"):
                 if "=" in p:
                     k, v = p.split("=", 1)
-                    params[k] = v
+                    params[k] = urllib.parse.unquote_plus(v)
 
         try:
             if path == "/api/index":
@@ -428,6 +570,78 @@ class handler(BaseHTTPRequestHandler):
                     plan["rider"] = rider
                     json_response(self, plan)
 
+            # ── Strava routes ──
+
+            elif path == "/api/strava/auth":
+                rider_id = params.get("rider_id")
+                if not rider_id:
+                    json_response(self, {"error": "rider_id required"}, 400)
+                    return
+                auth_url = (
+                    f"https://www.strava.com/oauth/authorize"
+                    f"?client_id={STRAVA_CLIENT_ID}"
+                    f"&redirect_uri={urllib.parse.quote(STRAVA_REDIRECT_URI, safe='')}"
+                    f"&response_type=code"
+                    f"&scope=activity:read_all"
+                    f"&state={rider_id}"
+                )
+                json_response(self, {"auth_url": auth_url})
+
+            elif path == "/api/strava/callback":
+                code = params.get("code")
+                rider_id = params.get("state")
+                error = params.get("error")
+
+                if error or not code or not rider_id:
+                    redirect_response(self, f"{STRAVA_APP_URL}/?strava=error")
+                    return
+
+                try:
+                    token_data = strava_exchange_code(code)
+                    athlete = token_data.get("athlete", {})
+                    strava_athlete_id = athlete.get("id") or token_data.get("athlete_id")
+                    access_token = token_data["access_token"]
+                    refresh_token = token_data["refresh_token"]
+                    expires_at = int(token_data["expires_at"])
+
+                    db_modify(
+                        """INSERT INTO strava_tokens (rider_id, strava_athlete_id, access_token, refresh_token, expires_at)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(rider_id) DO UPDATE SET
+                             strava_athlete_id = excluded.strava_athlete_id,
+                             access_token = excluded.access_token,
+                             refresh_token = excluded.refresh_token,
+                             expires_at = excluded.expires_at,
+                             connected_at = CURRENT_TIMESTAMP""",
+                        [int(rider_id), strava_athlete_id, access_token, refresh_token, expires_at]
+                    )
+                    redirect_response(self, f"{STRAVA_APP_URL}/?strava=connected")
+                except Exception as e:
+                    redirect_response(self, f"{STRAVA_APP_URL}/?strava=error")
+
+            elif path == "/api/strava/status":
+                rider_id = params.get("rider_id")
+                if not rider_id:
+                    json_response(self, {"error": "rider_id required"}, 400)
+                    return
+                rows = db_execute(
+                    "SELECT strava_athlete_id FROM strava_tokens WHERE rider_id = ?",
+                    [int(rider_id)]
+                )
+                if rows:
+                    json_response(self, {"connected": True, "strava_athlete_id": rows[0]["strava_athlete_id"]})
+                else:
+                    json_response(self, {"connected": False, "strava_athlete_id": None})
+
+            elif path == "/api/strava/webhook":
+                # Strava webhook verification (GET)
+                challenge = params.get("hub.challenge")
+                verify_token = params.get("hub.verify_token")
+                if challenge:
+                    json_response(self, {"hub.challenge": challenge})
+                else:
+                    json_response(self, {"ok": True})
+
             else:
                 json_response(self, {"error": "Not found"}, 404)
         except Exception as e:
@@ -469,6 +683,49 @@ class handler(BaseHTTPRequestHandler):
                     [body["rider_id"], body["week_number"], body["day_key"]]
                 )
                 json_response(self, {"status": "completed"}, 201)
+
+            # ── Strava POST routes ──
+
+            elif path == "/api/strava/sync":
+                rider_id = body.get("rider_id")
+                if not rider_id:
+                    json_response(self, {"error": "rider_id required"}, 400)
+                    return
+                synced, total = sync_strava_rides(int(rider_id))
+                json_response(self, {"synced": synced, "total": total})
+
+            elif path == "/api/strava/disconnect":
+                rider_id = body.get("rider_id")
+                if not rider_id:
+                    json_response(self, {"error": "rider_id required"}, 400)
+                    return
+                # Best-effort deauthorize
+                rows = db_execute("SELECT access_token FROM strava_tokens WHERE rider_id = ?", [int(rider_id)])
+                if rows:
+                    strava_deauthorize(rows[0]["access_token"])
+                db_modify("DELETE FROM strava_tokens WHERE rider_id = ?", [int(rider_id)])
+                json_response(self, {"disconnected": True})
+
+            elif path == "/api/strava/webhook":
+                # Strava webhook event (POST) — must respond quickly
+                aspect_type = body.get("aspect_type")
+                object_type = body.get("object_type")
+                owner_id = body.get("owner_id")
+
+                if aspect_type == "create" and object_type == "activity" and owner_id:
+                    # Look up rider by strava_athlete_id
+                    rows = db_execute(
+                        "SELECT rider_id FROM strava_tokens WHERE strava_athlete_id = ?",
+                        [int(owner_id)]
+                    )
+                    if rows:
+                        rider_id = rows[0]["rider_id"]
+                        try:
+                            sync_strava_rides(rider_id)
+                        except Exception:
+                            pass  # Don't fail the webhook response
+
+                json_response(self, {"ok": True})
 
             else:
                 json_response(self, {"error": "Not found"}, 404)

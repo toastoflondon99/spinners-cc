@@ -6,6 +6,12 @@
     { "source": "/api/rides/:id", "destination": "/api/index" },
     { "source": "/api/stats", "destination": "/api/index" },
     { "source": "/api/training/:id", "destination": "/api/index" },
-    { "source": "/api/training/complete", "destination": "/api/index" }
+    { "source": "/api/training/complete", "destination": "/api/index" },
+    { "source": "/api/strava/auth", "destination": "/api/index" },
+    { "source": "/api/strava/callback", "destination": "/api/index" },
+    { "source": "/api/strava/status", "destination": "/api/index" },
+    { "source": "/api/strava/sync", "destination": "/api/index" },
+    { "source": "/api/strava/disconnect", "destination": "/api/index" },
+    { "source": "/api/strava/webhook", "destination": "/api/index" }
   ]
 }
